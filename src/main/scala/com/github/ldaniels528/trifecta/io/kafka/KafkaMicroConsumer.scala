@@ -2,7 +2,7 @@ package com.github.ldaniels528.trifecta.io.kafka
 
 import java.util.Properties
 import java.util.concurrent.atomic.{AtomicInteger, AtomicLong, AtomicReference}
-
+import java.nio.channels.ClosedChannelException
 import com.github.ldaniels528.commons.helpers.OptionHelper._
 import com.github.ldaniels528.commons.helpers.ResourceHelper._
 import com.github.ldaniels528.trifecta.io.ByteBufferUtils._
@@ -512,6 +512,7 @@ object KafkaMicroConsumer {
   def getConsumersForStorm()(implicit zk: ZKProxy): Seq[ConsumerDetailsPM] = kafkaUtil.getConsumersForStorm()
 
   def getReplicas(topic: String, brokers: Seq[Broker])(implicit zk: ZKProxy): Seq[ReplicaBroker] = {
+    logger.warn(s"getReplicas called ${topic}")
     val results = for {
       partition <- getTopicPartitions(topic)
       (leader, pmd, replicas) <- getLeaderPartitionMetaDataAndReplicas(TopicAndPartition(topic, partition), brokers)
@@ -548,31 +549,52 @@ object KafkaMicroConsumer {
     val topics = kafkaUtil.getBrokerTopicNames filterNot (_ == "__consumer_offsets")
 
     // capture the meta data for all topics
-    brokers.headOption map { broker =>
-      getTopicMetadata(broker, topics) flatMap { tmd =>
-        logger.debug(s"Trying to fetch ${tmd.topic}")
-        // check for errors
-        if (tmd.errorCode != 0) {
-          logger.warn(s"Could not read topic ${tmd.topic}, error: ${tmd.errorCode}")
-          None
-        } else {
-          // translate the partition meta data into topic information instances
-          tmd.partitionsMetadata flatMap {
-            case pmd if pmd.errorCode != 0 =>
-              logger.warn(s"Could not read partition ${tmd.topic}/${pmd.partitionId}, error: ${pmd.errorCode}")
-              None
-            case pmd =>
-              Some(TopicDetails(
-                tmd.topic,
-                pmd.partitionId,
-                pmd.leader map (b => Broker(b.host, b.port, b.id)),
-                pmd.replicas map (b => Broker(b.host, b.port, b.id)),
-                pmd.isr map (b => Broker(b.host, b.port, b.id)),
-                tmd.sizeInBytes))
-          }
+    var my_it=brokers.toIterator
+    var my_br:com.github.ldaniels528.trifecta.io.kafka.Broker=null
+    while (my_it.hasNext  && my_br==null) {
+      my_br = my_it.next()
+      try {
+        getTopicMetadata(my_br, topics)
+      }catch {
+        case ex: Exception => {
+          logger.error("Couldnt connect System ")
+          my_br=null
         }
       }
-    } getOrElse Nil
+    }
+    if (my_br==null) {
+      logger.error("getTopicList- No broker found")
+      return Nil
+    }
+
+       var data =
+          Try (getTopicMetadata(my_br, topics) flatMap { tmd =>
+          // check for errors
+          if (tmd.errorCode != 0) {
+              logger.warn(s"Could not read topic ${tmd.topic}, error: ${tmd.errorCode}")
+            None
+          } else {
+            // translate the partition meta data into topic information instances
+            tmd.partitionsMetadata flatMap {
+              case pmd if (pmd.errorCode != 0 && pmd.errorCode != 9) =>
+                logger.warn(s"Could not read partition ${tmd.topic}/${pmd.partitionId}, error: ${pmd.errorCode}")
+                None
+              case pmd =>
+                Some(TopicDetails(
+                  tmd.topic,
+                  pmd.partitionId,
+                  pmd.leader map (b => Broker(b.host, b.port, b.id)),
+                  pmd.replicas map (b => Broker(b.host, b.port, b.id)),
+                  pmd.isr map (b => Broker(b.host, b.port, b.id)),
+                  tmd.sizeInBytes))
+            }
+          }
+        }).recoverWith({
+            case (ex: Throwable) => logger.warn("Couldnt connect System "); Failure(ex);
+          }).getOrElse(Nil)
+
+      return data
+
   }
 
   /**
@@ -616,16 +638,40 @@ object KafkaMicroConsumer {
     * @param broker the specified { @link Broker broker}
     */
   private def connect(broker: Broker, clientID: String): SimpleConsumer = {
-    new SimpleConsumer(broker.host, broker.port, DEFAULT_FETCH_SIZE, 63356, clientID)
+      new SimpleConsumer(broker.host, broker.port, DEFAULT_FETCH_SIZE, 63356, clientID)
   }
 
   /**
     * Retrieves the partition meta data and replicas for the lead broker
     */
   private def getLeaderPartitionMetaDataAndReplicas(tap: TopicAndPartition, brokers: Seq[Broker]): Option[(Broker, PartitionMetadata, Seq[Broker])] = {
+
+    var my_it = brokers.toIterator
+    var my_broker:com.github.ldaniels528.trifecta.io.kafka.Broker = null
+    var my_consumer:kafka.consumer.SimpleConsumer=null
+
+
+    while (my_it.hasNext && my_broker==null) {
+      try {
+        my_broker = my_it.next()
+        my_consumer=connect(my_broker,makeClientID("Test_con"))
+        getPartitionMetadata(my_broker, tap)
+
+      }catch {
+        case ex: Exception => {
+          logger.error("Couldnt connect System ")
+          my_broker=null
+        }
+      }
+      Try(my_consumer.close())
+      ()
+    }
+
     for {
-      pmd <- brokers.foldLeft[Option[PartitionMetadata]](None)((result, broker) =>
-        result ?? getPartitionMetadata(broker, tap).headOption)
+
+       // pmd <- brokers.foldLeft[Option[PartitionMetadata]](None)((result, broker) =>
+      //     result ?? getPartitionMetadata(broker, tap).headOption)
+      pmd <- getPartitionMetadata(my_broker, tap).headOption
       leader <- pmd.leader map (r => Broker(r.host, r.port, r.id))
       replicas = pmd.replicas map (r => Broker(r.host, r.port, r.id))
     } yield (leader, pmd, replicas)
@@ -637,17 +683,22 @@ object KafkaMicroConsumer {
   private def getPartitionMetadata(broker: Broker, tap: TopicAndPartition): Seq[PartitionMetadata] = {
     connect(broker, makeClientID("pmd_lookup")) use { consumer =>
       Try {
+
         consumer
           .send(new TopicMetadataRequest(Seq(tap.topic), correlationId))
           .topicsMetadata
           .flatMap(_.partitionsMetadata.find(_.partitionId == tap.partition))
 
       } match {
-        case Success(pmdSeq) => pmdSeq
+        case Success(pmdSeq) =>
+         // logger.warn(s"Returned data from partitioneddata ${pmdSeq}")
+          pmdSeq
         case Failure(e) =>
           throw new VxKafkaTopicException(s"Error communicating with Broker [$broker] to find Leader", tap, e)
+
       }
     }
+
   }
 
   /**
@@ -707,6 +758,9 @@ object KafkaMicroConsumer {
     */
   class VxKafkaException(message: String, cause: Throwable = null)
     extends RuntimeException(message, cause)
+
+  class KafkaConnectionException(message: String, cause: Throwable = null)
+    extends Exception(message, cause)
 
   /**
     * Represents a class of exceptions that occur while attempting to fetch data from a Kafka broker
